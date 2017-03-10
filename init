@@ -1,0 +1,273 @@
+#!/bin/busybox sh
+
+if [ "$DEBUG" = "1" ]; then
+	LOG=/tmp/log
+	set -x
+else
+	LOG=/dev/null
+	test -e "$LOG" || busybox mknod $LOG c 1 3
+fi
+exec 2>> $LOG
+
+# Prepare environment
+if busybox test ! -e /dev/tty; then
+    export PATH="/sbin:/bin:/system/bin:/system/xbin:$PATH"
+
+    # Install busybox synlinks
+    for link in `busybox --list`; do 
+        if ! busybox which $link > /dev/null; then
+            busybox ln $(busybox which busybox) /bin/$link
+        fi
+    done
+
+    # initialise /proc and /sys
+    mount -t proc proc /proc
+    mount -t sysfs sys /sys
+
+    if [ "$DEBUG" = "1" ]; then
+        # ensure that we can open a controlling tty
+        mknod /dev/tty c 5 0
+
+        # create device nodes then spawn on them
+        mknod /dev/tty2 c 4 2 && openvt
+        mknod /dev/tty3 c 4 3 && openvt
+    fi
+
+	# initialise /dev
+	echo $(which mdev) > /proc/sys/kernel/hotplug
+    mdev -s
+    sleep 1
+
+	# re-run this script with a controlling tty
+	exec env setsid cttyhack /bin/sh "$0" "$@"
+
+# Environment ready, start preparing Android boot
+else 
+    source /functions
+
+    # Scan sys again to populate late usb devices
+    mdev -s
+    sleep 1
+
+    # Declare config variables
+    CHRDST="${RAMDISK:-/chroot}"
+    SRCDST="${RAMDISK:-/mnt}"
+    ROOT="${ROOT:-}"
+    SCRIPT="${SCRIPT:-initrd.sh}"
+    RAMDISK="${RAMDISK:-ramdisk.img}"
+    SYSTEM="${SYSTEM:-system.img}"
+    DATA="${DATA:-}"
+    CACHE="${CACHE:-}"
+    FSTAB="${FSTAB:-}"
+    DEBUG="${DEBUG:-0}"
+    AUTOMOUNT="${AUTOMOUNT:-0}"
+    HEADER="${HEADER:-}"
+
+    # Create a few dirs if they do not exist
+    for i in "$CHRDST" "$SRCDST" /dev/block; do
+        if [ ! -d "$i" ]; then
+            mkdir "$i"
+        fi
+    done
+
+    for c in `cat /proc/cmdline`; do
+	    case $c in
+		    iso-scan/filename=*)
+			    eval `echo $c | cut -b1-3,18-`
+			    ;;
+		    *)
+			    ;;
+	    esac
+    done
+
+    # Locate the source/boot device
+    printLog "Searching for source device..."
+    if device="$(getDeviceFile "$ROOT" default root)"; then
+        if ! mount "$device" "$SRCDST" > /dev/null 2>&1; then
+            printLog "\tCould not mount source device '$device' at '$SRCDST'"
+
+        else
+            printLog "\tSource device '$device' mounted at '$SRCDST'"
+        fi
+    fi
+
+    # Locate the ramdisk device/file
+    printLog "Searching for ramdisk..."
+    if device="$(getDeviceFile "$RAMDISK" nodev ramdisk)"; then
+        # Allows us to break out at any time
+        while :; do
+            printLog "\tFound ramdisk '$device'"
+
+            # Mount/Extract ramdisk
+            if echo "$device" | grep -qe '^\/dev\/'; then
+                if ! mount "$device" "$CHRDST"; then
+                    printLog "\tCould not mount the ramdisk"; break
+                fi
+
+            else
+                mount -t tmpfs tmpfs "$CHRDST"
+
+                LASTPWD="$(pwd)"
+                cd "$CHRDST"
+                
+                if ! zcat "$device" | cpio -id > /dev/null; then
+                    printLog "\tFailed to extract the ramdisk"; break
+                fi
+
+                cd "$LASTPWD"
+            fi
+
+            # Make sure that some specific dirs exists in the ramdisk
+            for i in system data cache; do
+                if [ ! -d "$CHRDST/$i" ]; then
+                    mkdir "$CHRDST/$i"
+                fi
+            done
+
+            # Prepare fstab file
+            printLog "Preparing fstab file"
+            for i in $CHRDST/fstab* "$CHRDST/fstab"; do
+                if [ "$i" = "$CHRDST/fstab" ] || [ -f "$i" ]; then
+                    printLog "\tFound fstab at '$i'"
+
+                    if [ -n "$FSTAB" ] && [ -f "$SRCDST/$(echo "$FSTAB" | sed 's/^\///')" ]; then
+                        printLog "\tReplace fstab with '$SRCDST/$(echo "$FSTAB" | sed 's/^\///')'"
+                        cp -f "$SRCDST/$(echo "$FSTAB" | sed 's/^\///')" "$i"
+                   
+                    elif [ -f "$FSTAB" ] && [ "$FSTAB" != "$i" ]; then
+                        printLog "\tReplace fstab with '$FSTAB"
+                        cp -f "$FSTAB" "$i"
+                    fi
+
+                    FSTAB="$i"
+
+                    if [ ! -f $FSTAB ]; then
+                        touch "$FSTAB"
+                    fi
+
+                    break
+                fi
+            done
+
+            # Mount system
+            printLog "Searching for system image"
+            if sysdev="$(getDeviceFile "$SYSTEM" default system)"; then
+                printLog "\tFound system image '$sysdev'"
+
+                LASTPWD="$(pwd)"
+                cd "$CHRDST"
+
+                if [ "$AUTOMOUNT" != "1" -a "$DEBUG" != "1" ] || mount -o ro "$sysdev" system; then
+                    for i in cache data; do
+                        device=
+                        key=
+
+                        if [ "$i" = "data" ] && [ -n "$DATA" ]; then
+                            device="$(getDeviceFile "$DATA" default data)"
+                            key="$(getDeviceFile "$HEADER" default meta)"
+
+                        elif [ "$i" = "cache" ] && [ -n "$CACHE" ]; then
+                            device="$(getDeviceFile "$CACHE" default cache)"
+                        fi
+
+                        if [ -n "$device" ]; then
+                            printLog "\tMounting $device to /$i"
+
+                            if [ "$AUTOMOUNT" = "1" ] && [ -z "$key" ]; then
+                                if ! mount -o nosuid,nodev,noatime "$device" "$i"; then
+                                    printLog "\tFailed to mount $i"
+                                fi
+
+                            else
+                                if [ -z "$key" ]; then
+                                    if entry="$(grep -e "\(\s\)\+/$i\(\s\)\+" "$FSTAB")"; then
+                                        if [ "$device" = "$(echo "$entry" | sed 's/^\([^ \t]\+\).*/\1/')" ]; then
+                                            continue
+                                        fi
+                                    fi
+
+                                    echo "$device /$i $(getDeviceType "$device") nosuid,nodev,noatime wait,check" > "$FSTAB.bak"
+
+                                else
+                                    echo "$device /$i $(getDeviceType "$device") nosuid,nodev,noatime wait,check,encryptable=userdata,forcefdeorfbe=$key" > "$FSTAB.bak"
+                                    echo "ro.crypto.keyfile.userdata=$key" >> "default.prop"
+                                fi
+                            fi
+
+                            sed "s/.*\s\+\/$i\s\+.*//" "$FSTAB" >> "$FSTAB.bak"
+                            mv -f "$FSTAB.bak" "$FSTAB"
+
+                        else
+                            printLog "\tMoutning tmpfs to /$i"
+                            mount -t tmpfs tmpfs $i
+                        fi
+                    done
+
+                    while :; do
+                        if ! mountpoint -q system; then
+                            if entry="$(grep -e '\(\s\)\+/system\(\s\)\+' "$FSTAB")"; then
+                                if [ "$sysdev" = "$(echo "$entry" | sed 's/^\([^ \t]\+\).*/\1/')" ]; then
+                                    break
+                                fi
+                            fi
+
+                            echo "$sysdev /system $(getDeviceType "$sysdev") ro wait" > "$FSTAB.bak"
+                        fi
+
+                        sed 's/.*\s\+\/system\s\+.*//' "$FSTAB" >> "$FSTAB.bak"
+                        mv -f "$FSTAB.bak" "$FSTAB"
+                        break
+                    done
+
+                else
+                    printLog "\tFailed to mount system image"
+                fi
+
+                cd "$LASTPWD"
+            fi
+
+            break
+        done
+    fi
+
+    # Launch debug console
+    if [ "$DEBUG" = "1" ]; then
+        echo -e "\nSwitch between TTY's using F1, F2 and F3\nScroll using Shift+PgUp/PgDn\nEnter 'exit' to continue booting..."
+
+        if [ -d "$CHRDST/system" ]; then
+            ln -s "$CHRDST/system" /
+            ln -s /system/lib/modules /lib/
+            ln -s /system/lib/firmware /lib/
+        fi
+
+        if [ ! -x "$CHRDST/system/bin/sh" ] || ! USER="debug" "$CHRDST/system/bin/sh" -l 2>&1; then
+            sh 2>&1
+        fi
+
+        SWITCH=${SWITCH:-chroot}
+    fi
+
+    # Start Android
+    if [ -x "$CHRDST/init" ]; then
+        # Allow executing a custom script from src before running Android
+        if [ -n "$SCRIPT" ] && [ -x "$SRCDST/$(echo "$SCRIPT" | sed 's/^\///')" ]; then
+            SCRIPT="$SRCDST/$(echo "$SCRIPT" | sed 's/^\///')";
+        fi
+
+        # Let Android handle this
+        echo > /proc/sys/kernel/hotplug
+
+        # Run Android if the custom script allows it
+        if [ ! -x "$SCRIPT" ] || ( "$SCRIPT" ); then
+            exec ${SWITCH:-switch_root} "$CHRDST" /init
+        fi
+    fi
+fi
+
+# Stop kernel panic by starting an emergency shell
+while :; do
+    echo -e "\nAndroid-x86 emergency console\n"
+	
+    busybox sh 2>&1
+done
+
